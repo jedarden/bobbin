@@ -51,24 +51,63 @@ about.
   is acceptable, and an operator endpoint that mutates policy is more surface
   than the convenience is worth.
 
-## Fetch and push are separate permissions
+## Default-deny allowlist, not push detection
 
-A worker that only needs to read should not be able to write, and that
-distinction has to be enforced on the request itself.
+The original framing of this feature — *detect a push and gate it* — was wrong,
+and research disproved it empirically. **`git-receive-pack` is not the only way
+to write.** Confirmed write paths that never touch it:
 
-Git makes this legible: the service is named in the `?service=` query parameter
-on `info/refs`, and in the POST path (`git-upload-pack` = fetch,
-`git-receive-pack` = push). BOBBIN keys its decision on those.
+- **WebDAV.** If the `info/refs?service=git-receive-pack` response is not a smart
+  advertisement, git falls back to `git http-push`, which writes with `PROPFIND`,
+  `MKCOL`, `PUT`, `MOVE`, `LOCK`, `DELETE`. Observed on the wire:
+  `GIT_SMART_HTTP=0 git push` issued `PROPFIND` and never touched
+  `git-receive-pack`. Forgejo would reject it — but a worker controls its own
+  client, so BOBBIN must not delegate that refusal upstream.
+- **Git LFS.** `PUT /info/lfs/objects/{oid}/{size}` writes object content; the
+  lock endpoints mutate state.
+- **Forgejo's REST API and web UI.** The injected credential is valid for the
+  whole instance, so any proxied URL space broader than the git endpoints lets a
+  worker delete repos or mint tokens — authenticated, and not a git push.
+- **Wiki repos.** `{repo}.wiki` routes through the same git handlers, so it is a
+  write to a *different repository* than `{repo}`.
 
-Note that the credential must be injected for **both** services, not just push.
-Forgejo runs with `REQUIRE_SIGNIN_VIEW`, so an anonymous
-`info/refs?service=git-upload-pack` returns 401 even for a public repo — a
-design that only authenticates pushes would break every clone. The distinction
-governs *authorisation*, not whether to authenticate.
+There is a symmetric read-path surprise: **dumb HTTP** clones fully without ever
+touching `git-upload-pack`, using only `GET /objects/...`. And the fallback
+triggers on any `info/refs` response whose `Content-Type` is not the expected
+advertisement type — so mangling one header silently converts every client to
+dumb HTTP and every push to WebDAV.
 
-This is security-critical and therefore the thing to get *provably* right: the
-research task is to confirm there is no path by which a client can write without
-transiting `git-receive-pack`. Until that is confirmed, treat it as unproven.
+**So the policy is an allowlist of (method, exact path shape), default-deny.**
+The question BOBBIN answers is *"is this one of the few known read endpoints?"*,
+never *"is this a push?"*. Anything unrecognised and not GET/HEAD is treated as
+a write and refused — which is also Forgejo's own internal default.
+
+Authentication is separate from authorisation here: the credential is injected
+for **both** services, because Forgejo's `REQUIRE_SIGNIN_VIEW` makes even an
+anonymous fetch return 401. The allowlist governs what is permitted, not whether
+to authenticate.
+
+## Never hand the caller anything that authenticates
+
+Two leak channels were found, both live, and neither is obvious:
+
+- **`Set-Cookie`.** Forgejo returns `i_like_gitea=<session-id>` on git HTTP
+  endpoints. That is a session credential; passing it through hands the worker
+  exactly what BOBBIN exists to withhold. The git spec explicitly permits
+  stripping it — servers must not require cookies to function.
+- **LFS batch responses**, which echo the injected `Authorization` header back
+  in the response body (see the LFS section).
+
+BOBBIN strips `Set-Cookie`, `Set-Cookie2`, `WWW-Authenticate` and
+`Authentication-Info` from responses, and `Cookie`/`Authorization` from
+requests.
+
+Also: **never return `401`.** A 401 invites git into a credential-helper retry
+loop against a proxy that will never accept client credentials, and an upstream
+401 relayed verbatim points the investigation at the *worker's* missing
+credentials rather than at BOBBIN's rejected token. Deny with `403`; report an
+upstream credential failure as `502`. Both with a `text/plain` body, which git
+surfaces as `remote: <text>`.
 
 ## Transparency to a stock git client
 

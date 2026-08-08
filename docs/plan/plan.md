@@ -133,9 +133,15 @@ Anything that would require state (rate accounting, caching) is out of scope.
   grey-clouded hostname for git traffic removes both. Cloudflare Tunnel is not
   a workaround — same class of limit.
 
-- **Is `git-receive-pack` genuinely the only write path?** The fetch/push
-  distinction is the security boundary, so this needs proving rather than
-  assuming. _Protocol research pending._
+- **Is `git-receive-pack` genuinely the only write path?** → **Resolved: NO,
+  and this changes the policy model.** Confirmed write paths that bypass it:
+  WebDAV via `git http-push` (observed on the wire — `GIT_SMART_HTTP=0 git push`
+  issued `PROPFIND` and never touched `git-receive-pack`), LFS object `PUT`,
+  Forgejo's REST API and web UI under the injected credential, and `{repo}.wiki`
+  routed through the same handlers. Dumb HTTP is likewise a full read path that
+  never touches `git-upload-pack`. The policy is therefore a **default-deny
+  allowlist of (method, exact path shape)**, answering "is this a known read
+  endpoint?" rather than "is this a push?".
 
 - **Does this survive Cloudflare?** Partly answered: fleet history records
   **413** on large bodies and **504 at roughly a 240 s per-request ceiling**.
@@ -154,6 +160,21 @@ Anything that would require state (rate accounting, caching) is out of scope.
   token scopes when `IsBasicAuth` is true; header-token auth 500s on LFS paths;
   and only Basic's path matching covers LFS.
 - **Rate-limit in BOBBIN.** Forgejo has none, by deliberate design.
+- **Strip `Set-Cookie` from responses.** Forgejo returns an `i_like_gitea`
+  session cookie on git HTTP endpoints — a second credential-leak channel,
+  independent of LFS.
+- **Use `httputil.ReverseProxy`'s `Rewrite`, never `Director`.** `Director` runs
+  *before* hop-by-hop header stripping, so a caller sending
+  `Connection: Authorization` makes Go delete the credential BOBBIN just
+  injected. `Rewrite` also drops client-supplied `X-Forwarded-*`.
+- **Set `FlushInterval = -1` explicitly**; it currently auto-flushes only
+  because git responses happen to be chunked.
+- **Decide allow/deny before reading the body** — ideally at `info/refs`, so a
+  rejected push never uploads a pack. Go reads at most 256 KiB of an unread body
+  before closing, which turns a 403 into an opaque transport error.
+- **Pin the upstream host and never relay a 3xx.** Observed: git re-bases its
+  URL on redirect and sends every subsequent request directly to the new host,
+  silently leaving the proxy.
 - **Never set `Content-Length` on a proxied push.** Cloudflare enforces its
   100 MiB cap pre-emptively off that header; real pushes are chunked and dodge
   the check, so buffering re-arms it and turns a working push into a 413.
