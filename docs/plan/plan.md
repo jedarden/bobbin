@@ -96,24 +96,56 @@ Anything that would require state (rate accounting, caching) is out of scope.
 - **Build or adopt?** The most consequential question, and deliberately first.
   Writing a git proxy means owning protocol edge cases indefinitely.
 
-- **Where does BOBBIN's own credential come from?** rs-manager OpenBao is
-  unreachable from this cluster's pods. Candidates: a plain Secret, a
-  SealedSecret, the in-cluster `openbao-experiment` instance with Kubernetes
-  auth (a NEEDLE-pod-style SA-JWT login was proven on this cluster on
-  2026-08-02), or waiting for Tailscale + ESO under needle-pod's M0. It must
-  work today without M0.
+### Resolved by research (see `../research/deployment-and-credentials.md`)
 
-- **How do callers authenticate to BOBBIN?** Nothing, a shared bearer, or
-  per-pod ServiceAccount identity — partly determined by whether Calico is
-  actually enforcing NetworkPolicy here.
+- **Credential source** → a plain Kubernetes Secret, materialised once from
+  OpenBao on the EX44, consumed via `envFrom: secretRef`. Named so that an
+  `ExternalSecret` producing the same name and keys replaces it under M0 with
+  **zero change to the Deployment**. The in-cluster `openbao-experiment` was
+  rejected despite working: shamir seal, no auto-unseal, on a churning Spot
+  node — a restart would put every worker's ability to clone behind a manual
+  3-of-5 unseal, and the rig is slated for teardown.
+
+- **Caller authentication** → NetworkPolicy as the real boundary (Calico
+  enforcement confirmed empirically), plus warden's shared bearer for audit
+  attribution. Per-pod ServiceAccount identity is a well-scoped phase 2.
+
+- **Deployment shape** → namespace `bobbin`, Deployment + ClusterIP, 2 replicas
+  with anti-affinity (Spot churn is active), no ingress, no PVC,
+  `imagePullSecrets` mandatory because `ronaldraygun/*` is private.
 
 - **Git LFS.** Support, or detect and refuse clearly? Silently breaking LFS
   repos is the outcome to avoid.
 
 - **Is `git-receive-pack` genuinely the only write path?** The fetch/push
   distinction is the security boundary, so this needs proving rather than
-  assuming.
+  assuming. _Protocol research pending._
 
-- **Does this survive Cloudflare?** Long-running clone and push POSTs pass
-  through Cloudflare to Forgejo; proxy timeouts and buffering behaviour there
-  could bound the maximum usable repo size.
+- **Does this survive Cloudflare?** Partly answered: fleet history records
+  **413** on large bodies and **504 at roughly a 240 s per-request ceiling**.
+  BOBBIN must therefore set no response timeout upstream, stream both
+  directions, and pass those statuses through verbatim. The remaining unknown is
+  what repo size that bounds in practice.
+
+### New requirements surfaced by research
+
+- **Canonicalise repo paths before matching.** Forgejo matches
+  case-insensitively and treats `.git` as optional (both verified live), so an
+  exact-string allowlist is bypassable by capitalisation. This is the highest-risk
+  detail in the policy core.
+- **Forward the `Git-Protocol` header.** Protocol v2 is live upstream; dropping
+  the header silently downgrades every clone to v0.
+- **Strip `WWW-Authenticate` from upstream 401s**, or git attempts its
+  credential helper and — on any client without `GIT_TERMINAL_PROMPT=0` — hangs.
+- **Forward upstream error bodies byte-for-byte on push failure.** Forgejo's
+  pre-receive hook rejects blobs >100 MB with a message naming the `size:allow`
+  escape hatch; swallowing it turns a self-explaining failure into a mystery.
+
+### Prerequisite fix in needle-pod
+
+`lib/workspaces.sh` hardcodes `https://` when writing `.git-credentials`. Git's
+`store` helper matches on **scheme + host**, so that entry will not match an
+`http://bobbin…` clone and every clone would 401. The scheme must be derived
+from `NEEDLE_POD_GIT_BASE_URL`. Separately, `clone_workspaces()` accepts a full
+URL as a workspace entry, which would bypass BOBBIN entirely — forbid it or
+rewrite to the BOBBIN base.

@@ -40,12 +40,16 @@ about.
 - It should be derivable from the same list the worker is given
   (`NEEDLE_POD_WORKSPACES`), so a repo a worker cannot clone is also a repo it
   cannot push to. Divergence between those two lists is a bug, not a feature.
-- Path matching must be exact and canonicalised. Repo paths arrive as URL path
-  segments, so traversal (`../`), encoding tricks, case differences, and the
-  optional `.git` suffix are all attack surface.
-- **Open question:** whether the allowlist is static config (simple, needs a
-  restart to add a repo) or served from a small operator-only endpoint (matches
-  warden's split, more moving parts). Leaning static until there is a reason.
+- **Canonicalisation is mandatory, and this is measured rather than theoretical.**
+  Forgejo matches repo paths **case-insensitively** and treats the `.git` suffix
+  as optional: `JedArden/Warden.git/info/refs` returns 200, and
+  `jedarden/warden/info/refs` returns 200. So a naive exact-string allowlist is
+  **bypassable by changing capitalisation**. Required order: URL-decode → reject
+  `..` and `%2f` → strip a trailing `.git` → lowercase → compare against a
+  lowercased allowlist.
+- **Resolved:** the allowlist is static configuration. A restart to add a repo
+  is acceptable, and an operator endpoint that mutates policy is more surface
+  than the convenience is worth.
 
 ## Fetch and push are separate permissions
 
@@ -55,6 +59,12 @@ distinction has to be enforced on the request itself.
 Git makes this legible: the service is named in the `?service=` query parameter
 on `info/refs`, and in the POST path (`git-upload-pack` = fetch,
 `git-receive-pack` = push). BOBBIN keys its decision on those.
+
+Note that the credential must be injected for **both** services, not just push.
+Forgejo runs with `REQUIRE_SIGNIN_VIEW`, so an anonymous
+`info/refs?service=git-upload-pack` returns 401 even for a public repo — a
+design that only authenticates pushes would break every clone. The distinction
+governs *authorisation*, not whether to authenticate.
 
 This is security-critical and therefore the thing to get *provably* right: the
 research task is to confirm there is no path by which a client can write without
@@ -93,14 +103,23 @@ worker tried to exceed its scope.
 BOBBIN needs to know who is asking, or the allowlist is per-deployment rather
 than per-worker.
 
-Options, in rising order of cost: nothing (rely on NetworkPolicy and treat the
-whole cluster as one caller), a shared bearer token like warden's
-`warden-caller-tokens`, or per-pod ServiceAccount identity. warden started
-shared-bearer with a documented intent to move to per-agent identity under SEAM;
-BOBBIN should not do worse, and need not do better on day one.
+**Resolved: NetworkPolicy as the primary control, plus a shared bearer for
+attribution.** Calico enforcement on agent-sandbox was confirmed empirically —
+traffic to a netpol-selected pod is *dropped* (6 s timeout) while an unselected
+pod *refuses* in 9 ms. So a namespace-scoped ingress policy is a real boundary,
+not decoration.
 
-**Open question**, and it depends on whether Calico is actually enforcing
-NetworkPolicy on agent-sandbox — under research.
+The bearer is explicitly **not** a defence against the agent: a process running
+model-generated commands can read anything its pod can read, which is exactly
+why the Forgejo PAT must not be there. Its value is audit attribution and
+defence-in-depth, and warden's implementation already exists. What the pod ends
+up holding is a token valid only against an in-cluster ClusterIP and bounded by
+the allowlist — categorically weaker than an account-wide, non-expiring PAT.
+
+Per-pod ServiceAccount identity is a clean phase 2: the worker already carries a
+projected, auto-rotating SA token, and a git credential helper that reads it
+would give BOBBIN a fresh kubelet-issued credential per git invocation — which a
+once-written `.git-credentials` can never do.
 
 ## Fail closed
 
