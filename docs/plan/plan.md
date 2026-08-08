@@ -75,11 +75,14 @@ Anything that would require state (rate accounting, caching) is out of scope.
 
 ## Implementation Phases
 
-- [ ] **P0 — Research.** Protocol requirements, Forgejo specifics, prior art,
-      deployment and credential sourcing. **In progress.**
-- [ ] **P1 — Decide build vs adopt.** If a maintained proxy already does this
-      safely, adopt it and write only the policy layer. This decision gates
-      everything below and is a real fork, not a formality.
+- [x] **P0 — Research.** Protocol requirements, Forgejo specifics, prior art,
+      deployment and credential sourcing. **Complete** — four tracks, all in
+      `../research/`.
+- [ ] **P1 — Decide the shape.** No longer "build vs adopt": nothing is
+      adoptable (every credible implementation hides its git-HTTP logic under Go
+      `internal/`), so the real fork is **broker vs proxy**, and it depends on a
+      decision outside this repo. See "The decision that sizes this project"
+      below. **Blocking.**
 - [ ] **P2 — Policy core.** Pure, tested first, before any networking.
 - [ ] **P3 — Proxy with credential injection.** Verified against a real clone
       and a real push, including a large repo and a shallow clone.
@@ -91,10 +94,54 @@ Anything that would require state (rate accounting, caching) is out of scope.
 - [ ] **P6 — Revoke the direct token.** The change is only real once the
       account-wide token is gone from the cluster.
 
+## The decision that sizes this project
+
+Research turned the central question from "build or adopt" into something
+sharper, because **nothing is adoptable** — every credible implementation buries
+its git-HTTP logic under Go `internal/`, so reuse means reading code, not
+importing it.
+
+The real fork is **broker vs proxy**, and it hinges on the Forgejo version:
+
+**Forgejo v15.0 (2026-04-16) shipped per-repository scoped tokens**, enforced on
+the git smart-HTTP path, not just the API. On such a server, the per-repo
+allowlist and the fetch/push split are enforced **by Forgejo** — and most of
+this repo's reason to exist evaporates.
+
+`git.ardenone.com` runs **10.0.0**. Current stable is 16.0.2.
+
+| | **Broker** (needs Forgejo ≥v15) | **Proxy** (works on v10 today) |
+|---|---|---|
+| Size | ~200 lines | ~2,000 lines |
+| Enforces policy | Forgejo | BOBBIN |
+| Git protocol parsing | none | all of it |
+| On the critical path | no | **yes — new SPOF** |
+| LFS gap | none | must block or rewrite |
+| Attack surface from §5 research | none | redirect, smuggling, traversal |
+| Residual exposure | a single-repo, minimally-scoped, non-expiring token in the pod for its lifetime | no token in the pod at all |
+
+The broker mints a repo-scoped token per pod, serves it over the **`git-sync
+--askpass-url` wire format**, authenticates the pod with a **projected SA token
++ `TokenReview`**, and revokes on teardown. Its one weakness: the minter needs a
+user password or site-admin rights — a credential *more* powerful than the PAT
+it replaces — so it must be isolated.
+
+**Build the proxy anyway if** push policy must be finer than "which repo"
+(per-branch or per-path — precisely why Anthropic built theirs), or a
+never-expiring token in the pod is unacceptable even scoped to one repo, or one
+audited chokepoint for all fleet git traffic is itself the goal.
+
+**Before either, run the 10-minute experiment** (`../research/prior-art-and-build-vs-adopt.md`
+§7): on a v15+ server, verify a repo-scoped token clones, cannot push, cannot
+reach a second private repo, and cannot upload LFS objects. Given
+**CVE-2026-28744** — where sending a token as `Bearer` instead of Basic bypassed
+repo scope checks entirely on the git path, two months ago — this must be tested,
+not assumed.
+
 ## Open Questions
 
-- **Build or adopt?** The most consequential question, and deliberately first.
-  Writing a git proxy means owning protocol edge cases indefinitely.
+- **Upgrade Forgejo, or build the proxy?** The question above, and the only one
+  that matters right now. It is an infrastructure decision outside this repo.
 
 ### Resolved by research (see `../research/deployment-and-credentials.md`)
 
