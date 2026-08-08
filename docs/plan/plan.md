@@ -114,8 +114,24 @@ Anything that would require state (rate accounting, caching) is out of scope.
   with anti-affinity (Spot churn is active), no ingress, no PVC,
   `imagePullSecrets` mandatory because `ronaldraygun/*` is private.
 
-- **Git LFS.** Support, or detect and refuse clearly? Silently breaking LFS
-  repos is the outcome to avoid.
+- **Git LFS** → **resolved: block `/info/lfs/` by default.** Not a compatibility
+  question after all. Forgejo's batch endpoint copies the inbound
+  `Authorization` header into the response body verbatim, so an untouched LFS
+  request hands the injected PAT straight back to the pod. Rewriting batch JSON
+  is possible but makes BOBBIN protocol-aware; blocking is honest and safe, and
+  no repo in the current worker set uses LFS.
+
+- **Should Forgejo be upgraded to ≥v15?** Per-repo token scoping does not exist
+  in 10.x — it shipped in v15.0 (April 2026). That upgrade is the single
+  highest-leverage change available to this threat model, because it turns the
+  account-wide token into a genuinely per-repo credential and demotes BOBBIN's
+  allowlist to defence-in-depth. Out of BOBBIN's scope to decide, but it should
+  be on someone's list.
+
+- **Should git move to a DNS-only hostname?** Cloudflare imposes a hard
+  100 MiB request cap and a 125 s read timeout on the current hostname. A
+  grey-clouded hostname for git traffic removes both. Cloudflare Tunnel is not
+  a workaround — same class of limit.
 
 - **Is `git-receive-pack` genuinely the only write path?** The fetch/push
   distinction is the security boundary, so this needs proving rather than
@@ -129,6 +145,18 @@ Anything that would require state (rate accounting, caching) is out of scope.
 
 ### New requirements surfaced by research
 
+- **Strip inbound `Authorization` headers and `token`/`access_token` query
+  params.** Forgejo tries auth methods in order, first-user-wins, with OAuth2
+  before Basic and query-param tokens still enabled. A caller supplying its own
+  token would execute as itself while BOBBIN evaluated policy for another
+  identity — the allowlist becomes advisory. This is a correctness requirement.
+- **Inject with HTTP Basic, not `Authorization: token`.** Forgejo only enforces
+  token scopes when `IsBasicAuth` is true; header-token auth 500s on LFS paths;
+  and only Basic's path matching covers LFS.
+- **Rate-limit in BOBBIN.** Forgejo has none, by deliberate design.
+- **Never set `Content-Length` on a proxied push.** Cloudflare enforces its
+  100 MiB cap pre-emptively off that header; real pushes are chunked and dodge
+  the check, so buffering re-arms it and turns a working push into a 413.
 - **Canonicalise repo paths before matching.** Forgejo matches
   case-insensitively and treats `.git` as optional (both verified live), so an
   exact-string allowlist is bypassable by capitalisation. This is the highest-risk

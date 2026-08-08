@@ -79,9 +79,14 @@ That means it must be faithful to the smart-HTTP protocol:
 
 - Preserve pkt-line framing byte-for-byte, including the `# service=`
   advertisement and flush packets.
-- **Stream, never buffer.** A clone or push body can be very large; buffering it
-  breaks memory bounds and stalls sideband progress reporting. This is the
-  requirement most likely to be violated by a naive `httputil.ReverseProxy`.
+- **Stream, never buffer** — and the reason is sharper than memory bounds.
+  Cloudflare sits in front of Forgejo with a **100 MiB request cap enforced
+  pre-emptively off `Content-Length`**, and a **125 s read timeout**. Real
+  pushes use chunked encoding and send no `Content-Length`, so they dodge the
+  size pre-check; if BOBBIN buffers the request body it *sets* one and converts
+  a working push into an instant 413. Buffering the response is equally bad:
+  git's sideband keepalives every 5 s are what keep the 125 s timer from
+  firing, and buffering collapses them into silence.
 - Preserve `Content-Type`s and chunked transfer-encoding exactly.
 - Tolerate long-running requests. A large clone can outlast a default HTTP
   timeout, and Cloudflare sits in front of the upstream.
@@ -131,12 +136,59 @@ Specifically: if BOBBIN cannot load its own credential it must **fail to
 start**, not start and serve 500s. A proxy that is up but cannot authenticate
 looks healthy to Kubernetes while every worker silently fails to clone.
 
-## Git LFS
+## Reject any credential the caller supplies
 
-Unresolved. LFS uses a separate batch API and object transfer, so a
-smart-HTTP-only proxy may silently break any repo using it. Needs a decision:
-support it, or detect and refuse it with a clear error rather than a confusing
-partial failure. Under research.
+A caller must not be able to authenticate as anyone but the identity BOBBIN
+assigns it. Forgejo tries auth methods in order and **the first one yielding a
+user wins**, with OAuth2 registered before Basic and query-parameter tokens
+still enabled in this version.
+
+So a pod supplying `?access_token=<its own token>` would execute the request as
+*itself*, while BOBBIN evaluated policy for a different identity. That turns the
+allowlist from a boundary into a suggestion.
+
+**BOBBIN strips inbound `Authorization` headers and `token` / `access_token`
+query parameters before injecting its own.** Not hardening — a correctness
+requirement.
+
+Relatedly, injection must use **HTTP Basic**, not `Authorization: token`.
+Forgejo only enforces token scopes when `IsBasicAuth` is true, header-token auth
+returns 500 on LFS paths, and only Basic's path matching covers LFS at all.
+
+## Git LFS is a credential leak, not a compatibility gap
+
+Measured, not theorised: Forgejo's LFS batch endpoint **copies the inbound
+`Authorization` header into the response body**, so the client is handed back
+the exact credential used upstream. Decoded and compared byte-for-byte against
+what was sent — identical.
+
+Left untouched, a single `git lfs` operation hands the injected PAT to the pod
+and defeats the entire premise. A second, independent problem: batch responses
+build object URLs from the server's configured base URL rather than the request
+Host, so clients get URLs pointing at the real Forgejo origin and route object
+traffic around the proxy.
+
+So LFS forces a decision, and "not yet implemented" is not one of the options:
+
+- **Rewrite** — parse batch JSON, strip `header.Authorization`, substitute a
+  BOBBIN-issued handle, rewrite `href` to point back at BOBBIN. Correct, but
+  makes BOBBIN a protocol-aware participant rather than a passthrough.
+- **Block** — refuse `/info/lfs/` with a legible error. Honest, trivially safe,
+  and breaks any repo that uses LFS.
+
+**Default to blocking until a repo actually needs LFS.** A loud, understood
+failure beats a silent credential leak, and no repo in the current worker set
+uses LFS.
+
+## Rate limiting
+
+**Forgejo has no rate limiting at all** — verified against its config schema,
+middleware chain, and live response headers, and its own documentation says this
+is deliberate because rate limiting belongs in the reverse proxy.
+
+That makes it BOBBIN's job. A fleet of workers retrying a failing clone in a
+restart loop is exactly the shape of traffic that would otherwise hit Forgejo
+unbounded.
 
 ## Designed for absorption into SEAM
 
